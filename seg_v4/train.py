@@ -1,0 +1,143 @@
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import torchvision.models as models
+import torch.utils.data as torch_data
+import matplotlib.pyplot as plt
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+
+from torchvision import transforms
+from tensorboardX import SummaryWriter
+from torch.autograd import Variable
+from tqdm import tqdm
+from model import *
+
+import util.loader.transform as tr
+from util.loader.loader import DAVIS2016
+from util.metrics import runningScore
+from util.loss import *
+from util.utils import *
+from util.helpers import *
+
+from PIL import Image
+
+img_rows   = 256
+img_cols   = 512
+batch_size = 4
+lr         = 1e-4
+
+ttransforms = transforms.Compose([tr.ScaleNRotate(), tr.RandomHorizontalFlip(), tr.Resize([img_rows, img_cols]), tr.ToTensor()])
+tdataset = DAVIS2016(root='/home/wilson/DL/project/dataset/davis.pkl', split='train', transform=ttransforms)
+tdataloader = torch.utils.data.DataLoader(tdataset, batch_size=batch_size, shuffle=True, num_workers=8)
+
+vtransforms = transforms.Compose([tr.Resize([img_rows, img_cols]), tr.ToTensor()])
+vdataset = DAVIS2016(root='/home/wilson/DL/project/dataset/davis.pkl', split='val', transform=vtransforms)
+vdataloader = torch.utils.data.DataLoader(vdataset, batch_size=1, shuffle=False, num_workers=8)
+
+# Setup Metrics
+running_metrics = runningScore(pspnet_specs['n_classes'])
+
+# setup Model
+base_net = BaseNet()
+class_net = ClassNet()
+
+base_net.cuda()
+class_net.cuda()
+
+base_opt = torch.optim.Adam(base_net.parameters(), lr=lr,     betas=(0.5, 0.999))
+class_opt = torch.optim.Adam(class_net.parameters(), lr=lr,   betas=(0.5, 0.999))
+
+loss_fn = cross_entropy2d
+
+iter = 0
+writer = SummaryWriter('runs/test')
+best_iou = -100.0
+for epoch in range(100):
+    base_net.train()
+    class_net.train()
+    for i, (data1, data2, data3) in enumerate(tdataloader):
+        images1 = Variable(data1['image'].cuda())
+        images2 = Variable(data2['image'].cuda())
+        images3 = Variable(data3['image'].cuda())
+        labels1  = Variable(data1['gt'].type(torch.LongTensor).cuda())
+        labels2  = Variable(data2['gt'].type(torch.LongTensor).cuda())
+        labels3  = Variable(data3['gt'].type(torch.LongTensor).cuda())
+
+        poly_lr_scheduler(base_opt , lr, iter, lr_decay_iter=1, max_iter=1e+5)
+        poly_lr_scheduler(class_opt, lr, iter, lr_decay_iter=1, max_iter=1e+5)
+        iter += 1
+
+        #############step1################
+        hidden, inp = base_net(images1)
+        outputs = class_net(hidden, inp)
+        
+        base_opt.zero_grad()
+        class_opt.zero_grad()
+
+        loss = 0.3* loss_fn(input=outputs, target=labels1)
+        loss.backward(retain_graph=True)
+        class_opt.step()
+        base_opt.step()
+
+        #############step2###############
+        hidden, inp = base_net(images2, hidden)
+        outputs = class_net(hidden, inp)
+        
+        base_opt.zero_grad()
+        class_opt.zero_grad()
+
+        loss = 0.7* loss_fn(input=outputs, target=labels2)
+        loss.backward(retain_graph=True)
+        class_opt.step()
+        base_opt.step()
+ 
+        #############step3###############
+        hidden, inp = base_net(images3, hidden)
+
+        outputs = class_net(hidden, inp)
+        
+        base_opt.zero_grad()
+        class_opt.zero_grad()
+
+        loss = loss_fn(input=outputs, target=labels3)
+        loss.backward()
+        class_opt.step()
+        base_opt.step()
+ 
+        writer.add_scalar('Loss', loss.data[0], iter)
+        if (i+1) % 20 == 0:
+            print("Epoch [%d/%d] Loss: %.4f" % (epoch+1, 100, loss.data[0]))
+    base_net.eval()
+    class_net.eval()
+    for i_val, (data1, data2, data3) in tqdm(enumerate(vdataloader)):
+        images1 = Variable(data1['image'].cuda())
+        images2 = Variable(data2['image'].cuda())
+        images3 = Variable(data3['image'].cuda())
+        labels  = Variable(data3['gt'].type(torch.LongTensor).cuda())
+        
+        hidden, _ = base_net(images1)
+        hidden, _ = base_net(images2, hidden)
+        hidden, inp = base_net(images3, hidden)
+
+        outputs = class_net(hidden, inp)
+        
+        pred = outputs.data.max(1)[1].cpu().numpy()
+        gt = labels.data.cpu().numpy()
+        running_metrics.update(gt, pred)
+
+    score, class_iou = running_metrics.get_scores()
+    for k, v in score.items():
+        print(k, v)
+        if k == 'Mean IoU : \t':
+            writer.add_scalar('IoU', v, epoch+1)
+    
+    running_metrics.reset() 
+    
+    if score['Mean IoU : \t'] >= best_iou:
+        best_iou = score['Mean IoU : \t'] 
+        torch.save(base_net.state_dict(), "weight/base_net.pkl")
+        torch.save(class_net.state_dict(), "weight/class_net.pkl")
